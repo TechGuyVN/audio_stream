@@ -3,6 +3,7 @@
 #include "mod_audio_stream.h"
 #include "WebSocketClient.h"
 #include <switch_json.h>
+#include <switch_time.h>
 #include <fstream>
 #include <switch_buffer.h>
 #include <unordered_map>
@@ -249,6 +250,7 @@ public:
                             const int channels = tech_pvt->channels;
 
                             const size_t expected_frame_bytes = FRAME_SIZE_8000 * channels * outRate / 8000;
+                            int inferred_rate = inRate;
                             if (expected_frame_bytes > 0 && rawAudio.size() > expected_frame_bytes)
                             {
                                 const double ratio = static_cast<double>(rawAudio.size()) / expected_frame_bytes;
@@ -269,6 +271,7 @@ public:
                                         }
                                     }
 
+                                    inferred_rate = nearest;
                                     if (nearest != inRate)
                                     {
                                         inRate = nearest;
@@ -278,6 +281,10 @@ public:
                                     }
                                 }
                             }
+
+                            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+                                              "(%s) enqueue raw audio: %zu bytes inRate=%d inferred=%d outRate=%d channels=%d expected=%zu\n",
+                                              tech_pvt->sessionId, rawAudio.size(), sampleRate, inferred_rate, outRate, channels, expected_frame_bytes);
 
                             if (inRate != outRate)
                             {
@@ -559,6 +566,9 @@ namespace
             return NULL;
         }
 
+        uint32_t frame_log_count = 0;
+        switch_time_t last_underflow_log = 0;
+
         while (!tech_pvt->close_requested && switch_core_session_running(session))
         {
             if (switch_mutex_trylock(tech_pvt->write_mutex) == SWITCH_STATUS_SUCCESS)
@@ -571,7 +581,26 @@ namespace
                     write_frame.timestamp = write_timestamp;
                     write_frame.seq = write_seq++;
                     write_timestamp += write_frame.samples;
+                    if (frame_log_count < 5 || frame_log_count % 50 == 0)
+                    {
+                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+                                          "(%s) write_frame_thread seq=%u ts=%u datalen=%u samples=%u buffer_inuse=%zu\n",
+                                          tech_pvt->sessionId, write_frame.seq, write_frame.timestamp, write_frame.datalen,
+                                          write_frame.samples, available - write_frame.datalen);
+                    }
+                    frame_log_count++;
                     switch_core_session_write_frame(session, &write_frame, SWITCH_IO_FLAG_NONE, 0);
+                }
+                else
+                {
+                    switch_time_t now = switch_micro_time_now();
+                    if (now - last_underflow_log > 1000000)
+                    {
+                        last_underflow_log = now;
+                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+                                          "(%s) write_frame_thread underflow: available=%zu needed=%u seq=%u ts=%u\n",
+                                          tech_pvt->sessionId, available, bytes, write_seq, write_timestamp);
+                    }
                 }
                 switch_mutex_unlock(tech_pvt->write_mutex);
             }
