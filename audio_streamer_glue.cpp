@@ -9,6 +9,8 @@
 #include <unordered_set>
 #include <memory>
 #include "base64.h"
+#include <climits>
+#include <cstdlib>
 
 #define FRAME_SIZE_8000 320 /* 1000x0.02 (20ms)= 160 x(16bit= 2 bytes) 320 frame size*/
 
@@ -246,16 +248,34 @@ public:
                             const int outRate = tech_pvt->sampling;
                             const int channels = tech_pvt->channels;
 
-                            if (sampleRate <= 0 && inRate == outRate)
+                            const size_t expected_frame_bytes = FRAME_SIZE_8000 * channels * outRate / 8000;
+                            if (expected_frame_bytes > 0 && rawAudio.size() > expected_frame_bytes)
                             {
-                                const size_t expected_frame_bytes = FRAME_SIZE_8000 * channels * outRate / 8000;
-                                if (expected_frame_bytes > 0 && rawAudio.size() >= expected_frame_bytes * 2 &&
-                                    rawAudio.size() % expected_frame_bytes == 0)
+                                const double ratio = static_cast<double>(rawAudio.size()) / expected_frame_bytes;
+                                if (ratio > 1.1)
                                 {
-                                    inRate = outRate * 2;
-                                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
-                                                      "(%s) inferred inbound sample rate %d based on payload size %zu (expected %zu)\n",
-                                                      tech_pvt->sessionId, inRate, rawAudio.size(), expected_frame_bytes);
+                                    const int inferred = static_cast<int>(outRate * ratio + 0.5);
+                                    const int common_rates[] = {8000, 12000, 16000, 24000, 32000, 48000};
+                                    int nearest = inferred;
+                                    int nearest_diff = INT_MAX;
+
+                                    for (int rate : common_rates)
+                                    {
+                                        const int diff = abs(rate - inferred);
+                                        if (diff < nearest_diff)
+                                        {
+                                            nearest = rate;
+                                            nearest_diff = diff;
+                                        }
+                                    }
+
+                                    if (nearest != inRate)
+                                    {
+                                        inRate = nearest;
+                                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+                                                          "(%s) inferred inbound sample rate %d based on payload size %zu (expected %zu) ratio %.2f\n",
+                                                          tech_pvt->sessionId, inRate, rawAudio.size(), expected_frame_bytes, ratio);
+                                    }
                                 }
                             }
 
