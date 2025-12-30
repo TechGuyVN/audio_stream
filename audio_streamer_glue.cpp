@@ -519,6 +519,8 @@ namespace
         switch_frame_t write_frame = {0};
         switch_codec_t write_codec = {0};
         switch_codec_t *read_codec;
+        uint32_t write_timestamp = 0;
+        uint32_t write_seq = 0;
 
         uint32_t sample_rate = tech_pvt->sampling;
         uint32_t channels = tech_pvt->channels;
@@ -566,6 +568,9 @@ namespace
                 {
                     write_frame.datalen = (uint32_t)switch_buffer_read(tech_pvt->write_sbuffer, write_frame.data, bytes);
                     write_frame.samples = write_frame.datalen / 2 / channels;
+                    write_frame.timestamp = write_timestamp;
+                    write_frame.seq = write_seq++;
+                    write_timestamp += write_frame.samples;
                     switch_core_session_write_frame(session, &write_frame, SWITCH_IO_FLAG_NONE, 0);
                 }
                 switch_mutex_unlock(tech_pvt->write_mutex);
