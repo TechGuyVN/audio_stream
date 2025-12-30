@@ -222,7 +222,7 @@ public:
                 cJSON *jsonAudio = cJSON_DetachItemFromObject(jsonData, "audioData");
                 const char *jsAudioDataType = cJSON_GetObjectCstr(jsonData, "audioDataType");
                 std::string fileType;
-                int sampleRate;
+                int sampleRate = 0;
                 if (0 == strcmp(jsAudioDataType, "raw"))
                 {
                     cJSON *jsonSampleRate = cJSON_GetObjectItem(jsonData, "sampleRate");
@@ -242,9 +242,50 @@ public:
                                 return SWITCH_FALSE;
                             }
 
-                            const int inRate = tech_pvt->wsSampling;
+                            int inRate = sampleRate > 0 ? sampleRate : tech_pvt->wsSampling;
                             const int outRate = tech_pvt->sampling;
                             const int channels = tech_pvt->channels;
+
+                            if (sampleRate <= 0 && inRate == outRate)
+                            {
+                                const size_t expected_frame_bytes = FRAME_SIZE_8000 * channels * outRate / 8000;
+                                if (expected_frame_bytes > 0 && rawAudio.size() >= expected_frame_bytes * 2 &&
+                                    rawAudio.size() % expected_frame_bytes == 0)
+                                {
+                                    inRate = outRate * 2;
+                                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+                                                      "(%s) inferred inbound sample rate %d based on payload size %zu (expected %zu)\n",
+                                                      tech_pvt->sessionId, inRate, rawAudio.size(), expected_frame_bytes);
+                                }
+                            }
+
+                            if (inRate != outRate)
+                            {
+                                int err = RESAMPLER_ERR_SUCCESS;
+                                if (tech_pvt->write_resampler)
+                                {
+                                    spx_uint32_t current_in = 0, current_out = 0;
+                                    speex_resampler_get_rate(tech_pvt->write_resampler, &current_in, &current_out);
+                                    if (current_in != (spx_uint32_t)inRate || current_out != (spx_uint32_t)outRate)
+                                    {
+                                        err = speex_resampler_set_rate(tech_pvt->write_resampler, inRate, outRate);
+                                    }
+                                }
+                                else
+                                {
+                                    tech_pvt->write_resampler = speex_resampler_init(channels, inRate, outRate, SWITCH_RESAMPLE_QUALITY, &err);
+                                }
+
+                                if (err != RESAMPLER_ERR_SUCCESS)
+                                {
+                                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                                                      "(%s) processMessage - error configuring write resampler: %s\n",
+                                                      tech_pvt->sessionId, speex_resampler_strerror(err));
+                                    cJSON_Delete(jsonAudio);
+                                    cJSON_Delete(json);
+                                    return SWITCH_FALSE;
+                                }
+                            }
 
                             spx_uint32_t in_frames = rawAudio.size() / (sizeof(spx_int16_t) * channels);
                             spx_uint32_t max_out = (spx_uint32_t)((double)in_frames * outRate / inRate) + 1;
@@ -256,12 +297,7 @@ public:
                             spx_uint32_t in_len = in_frames;
                             spx_uint32_t out_len = max_out;
 
-                            if (tech_pvt->sampling == tech_pvt->wsSampling)
-                            {
-                                out_buf = in_buf;
-                                out_len = in_len;
-                            }
-                            else
+                            if (inRate != outRate)
                             {
                                 if (channels == 1)
                                 {
@@ -275,6 +311,11 @@ public:
                                                                             in_buf.data(), &in_len,
                                                                             out_buf.data(), &out_len);
                                 }
+                            }
+                            else
+                            {
+                                out_buf = in_buf;
+                                out_len = in_len;
                             }
 
                             const size_t bytes_out = out_len * channels * sizeof(spx_int16_t);
