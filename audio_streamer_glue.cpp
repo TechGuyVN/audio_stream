@@ -3,12 +3,15 @@
 #include "mod_audio_stream.h"
 #include "WebSocketClient.h"
 #include <switch_json.h>
+#include <switch_time.h>
 #include <fstream>
 #include <switch_buffer.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <memory>
 #include "base64.h"
+#include <climits>
+#include <cstdlib>
 
 #define FRAME_SIZE_8000 320 /* 1000x0.02 (20ms)= 160 x(16bit= 2 bytes) 320 frame size*/
 
@@ -222,7 +225,7 @@ public:
                 cJSON *jsonAudio = cJSON_DetachItemFromObject(jsonData, "audioData");
                 const char *jsAudioDataType = cJSON_GetObjectCstr(jsonData, "audioDataType");
                 std::string fileType;
-                int sampleRate;
+                int sampleRate = 0;
                 if (0 == strcmp(jsAudioDataType, "raw"))
                 {
                     cJSON *jsonSampleRate = cJSON_GetObjectItem(jsonData, "sampleRate");
@@ -242,9 +245,74 @@ public:
                                 return SWITCH_FALSE;
                             }
 
-                            const int inRate = tech_pvt->wsSampling;
+                            int inRate = sampleRate > 0 ? sampleRate : tech_pvt->wsSampling;
                             const int outRate = tech_pvt->sampling;
                             const int channels = tech_pvt->channels;
+
+                            const size_t expected_frame_bytes = FRAME_SIZE_8000 * channels * outRate / 8000;
+                            int inferred_rate = inRate;
+                            if (expected_frame_bytes > 0 && rawAudio.size() > expected_frame_bytes)
+                            {
+                                const double ratio = static_cast<double>(rawAudio.size()) / expected_frame_bytes;
+                                if (ratio > 1.1)
+                                {
+                                    const int inferred = static_cast<int>(outRate * ratio + 0.5);
+                                    const int common_rates[] = {8000, 12000, 16000, 24000, 32000, 48000};
+                                    int nearest = inferred;
+                                    int nearest_diff = INT_MAX;
+
+                                    for (int rate : common_rates)
+                                    {
+                                        const int diff = abs(rate - inferred);
+                                        if (diff < nearest_diff)
+                                        {
+                                            nearest = rate;
+                                            nearest_diff = diff;
+                                        }
+                                    }
+
+                                    inferred_rate = nearest;
+                                    if (nearest != inRate)
+                                    {
+                                        inRate = nearest;
+                                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+                                                          "(%s) inferred inbound sample rate %d based on payload size %zu (expected %zu) ratio %.2f\n",
+                                                          tech_pvt->sessionId, inRate, rawAudio.size(), expected_frame_bytes, ratio);
+                                    }
+                                }
+                            }
+
+                            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+                                              "(%s) enqueue raw audio: %zu bytes inRate=%d inferred=%d outRate=%d channels=%d expected=%zu\n",
+                                              tech_pvt->sessionId, rawAudio.size(), sampleRate, inferred_rate, outRate, channels, expected_frame_bytes);
+
+                            if (inRate != outRate)
+                            {
+                                int err = RESAMPLER_ERR_SUCCESS;
+                                if (tech_pvt->write_resampler)
+                                {
+                                    spx_uint32_t current_in = 0, current_out = 0;
+                                    speex_resampler_get_rate(tech_pvt->write_resampler, &current_in, &current_out);
+                                    if (current_in != (spx_uint32_t)inRate || current_out != (spx_uint32_t)outRate)
+                                    {
+                                        err = speex_resampler_set_rate(tech_pvt->write_resampler, inRate, outRate);
+                                    }
+                                }
+                                else
+                                {
+                                    tech_pvt->write_resampler = speex_resampler_init(channels, inRate, outRate, SWITCH_RESAMPLE_QUALITY, &err);
+                                }
+
+                                if (err != RESAMPLER_ERR_SUCCESS)
+                                {
+                                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                                                      "(%s) processMessage - error configuring write resampler: %s\n",
+                                                      tech_pvt->sessionId, speex_resampler_strerror(err));
+                                    cJSON_Delete(jsonAudio);
+                                    cJSON_Delete(json);
+                                    return SWITCH_FALSE;
+                                }
+                            }
 
                             spx_uint32_t in_frames = rawAudio.size() / (sizeof(spx_int16_t) * channels);
                             spx_uint32_t max_out = (spx_uint32_t)((double)in_frames * outRate / inRate) + 1;
@@ -256,12 +324,7 @@ public:
                             spx_uint32_t in_len = in_frames;
                             spx_uint32_t out_len = max_out;
 
-                            if (tech_pvt->sampling == tech_pvt->wsSampling)
-                            {
-                                out_buf = in_buf;
-                                out_len = in_len;
-                            }
-                            else
+                            if (inRate != outRate)
                             {
                                 if (channels == 1)
                                 {
@@ -275,6 +338,11 @@ public:
                                                                             in_buf.data(), &in_len,
                                                                             out_buf.data(), &out_len);
                                 }
+                            }
+                            else
+                            {
+                                out_buf = in_buf;
+                                out_len = in_len;
                             }
 
                             const size_t bytes_out = out_len * channels * sizeof(spx_int16_t);
@@ -458,6 +526,8 @@ namespace
         switch_frame_t write_frame = {0};
         switch_codec_t write_codec = {0};
         switch_codec_t *read_codec;
+        uint32_t write_timestamp = 0;
+        uint32_t write_seq = 0;
 
         uint32_t sample_rate = tech_pvt->sampling;
         uint32_t channels = tech_pvt->channels;
@@ -496,6 +566,9 @@ namespace
             return NULL;
         }
 
+        uint32_t frame_log_count = 0;
+        switch_time_t last_underflow_log = 0;
+
         while (!tech_pvt->close_requested && switch_core_session_running(session))
         {
             if (switch_mutex_trylock(tech_pvt->write_mutex) == SWITCH_STATUS_SUCCESS)
@@ -505,7 +578,29 @@ namespace
                 {
                     write_frame.datalen = (uint32_t)switch_buffer_read(tech_pvt->write_sbuffer, write_frame.data, bytes);
                     write_frame.samples = write_frame.datalen / 2 / channels;
+                    write_frame.timestamp = write_timestamp;
+                    write_frame.seq = write_seq++;
+                    write_timestamp += write_frame.samples;
+                    if (frame_log_count < 5 || frame_log_count % 50 == 0)
+                    {
+                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+                                          "(%s) write_frame_thread seq=%u ts=%u datalen=%u samples=%u buffer_inuse=%zu\n",
+                                          tech_pvt->sessionId, write_frame.seq, write_frame.timestamp, write_frame.datalen,
+                                          write_frame.samples, available - write_frame.datalen);
+                    }
+                    frame_log_count++;
                     switch_core_session_write_frame(session, &write_frame, SWITCH_IO_FLAG_NONE, 0);
+                }
+                else
+                {
+                    switch_time_t now = switch_micro_time_now();
+                    if (now - last_underflow_log > 1000000)
+                    {
+                        last_underflow_log = now;
+                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+                                          "(%s) write_frame_thread underflow: available=%zu needed=%u seq=%u ts=%u\n",
+                                          tech_pvt->sessionId, available, bytes, write_seq, write_timestamp);
+                    }
                 }
                 switch_mutex_unlock(tech_pvt->write_mutex);
             }
